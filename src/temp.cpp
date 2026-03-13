@@ -134,7 +134,7 @@ const unsigned long EMERGENCY_TIMEOUT_MS = 20000;
 // UIDs must match the value printed by Serial (uppercase hex string).
 static const char *EMERGENCY_UIDS[] = {
   "1C284C06",
-  "E0000002",
+  "EC6D4D06",
 };
 static const size_t EMERGENCY_UIDS_COUNT = sizeof(EMERGENCY_UIDS) / sizeof(EMERGENCY_UIDS[0]);
 
