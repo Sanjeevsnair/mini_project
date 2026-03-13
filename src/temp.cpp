@@ -1,6 +1,74 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
+// Temporary mode: use a SINGLE RC522 module on SS pin 5,
+// and switch its logical role (A/B/C) by typing A, B, or C in Serial Monitor.
+// Set to 0 to go back to true multi-reader mode.
+#define SINGLE_RFID_SERIAL_SWITCH 1
+
+// Stable RC522 reader helper: improves detection reliability by resetting RF field
+// after every successful read.
+bool readCardFromReader(MFRC522 &reader, String &uidOut)
+{
+  if (!reader.PICC_IsNewCardPresent())
+    return false;
+
+  if (!reader.PICC_ReadCardSerial())
+    return false;
+
+  String uid = "";
+
+  for (byte i = 0; i < reader.uid.size; i++)
+  {
+    if (reader.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(reader.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  reader.PICC_HaltA();
+  reader.PCD_StopCrypto1();
+
+  // reset RF field to prevent card lock
+  reader.PCD_AntennaOff();
+  delay(10);
+  reader.PCD_AntennaOn();
+
+  uidOut = uid;
+  return true;
+}
+
+enum RFIDRole { RFID_ROLE_A, RFID_ROLE_B, RFID_ROLE_C };
+static RFIDRole activeRFIDRole = RFID_ROLE_A;
+
+void handleSerialRFIDRoleSwitch()
+{
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+      continue;
+
+    if (c == 'A' || c == 'a')
+    {
+      activeRFIDRole = RFID_ROLE_A;
+      Serial.println("[RFID] Active role = A (Approaching)");
+    }
+    else if (c == 'B' || c == 'b')
+    {
+      activeRFIDRole = RFID_ROLE_B;
+      Serial.println("[RFID] Active role = B (Middle/Opposite)");
+    }
+    else if (c == 'C' || c == 'c')
+    {
+      activeRFIDRole = RFID_ROLE_C;
+      Serial.println("[RFID] Active role = C (Stop-line)");
+    }
+  }
+}
+
+MFRC522 &readerForRole(RFIDRole role);
+
 void trafficCycle(); void adjustTiming(); void countdown(int t);
 void detectOpposite();
 void detectApproaching();
@@ -20,6 +88,23 @@ void handleEmergencyMode();
 MFRC522 rfidA(SS_A, RST_PIN);
 MFRC522 rfidB(SS_B, RST_PIN);
 MFRC522 rfidC(SS_C, RST_PIN);
+
+MFRC522 &readerForRole(RFIDRole role)
+{
+#if SINGLE_RFID_SERIAL_SWITCH
+  (void)role;
+  // Single physical reader on SS pin 5 behaves as A/B/C.
+  return rfidA;
+#else
+  switch (role)
+  {
+    case RFID_ROLE_A: return rfidA;
+    case RFID_ROLE_B: return rfidB;
+    case RFID_ROLE_C: return rfidC;
+  }
+  return rfidA;
+#endif
+}
 
 #define RED 25
 #define YELLOW 26
@@ -171,23 +256,30 @@ void removeUID(String list[], int &size, String uid)
 
 void setup()
 {
-  Serial.begin(9600);
-  SPI.begin();
+  Serial.begin(115200);
+  SPI.begin(18, 19, 23);
 
-  // Ensure all MFRC522 SS pins are de-selected before init (important for multi-reader SPI)
+  // Ensure MFRC522 SS pins are de-selected before init (important for multi-reader SPI)
   pinMode(SS_A, OUTPUT); digitalWrite(SS_A, HIGH);
+#if !SINGLE_RFID_SERIAL_SWITCH
   pinMode(SS_B, OUTPUT); digitalWrite(SS_B, HIGH);
   pinMode(SS_C, OUTPUT); digitalWrite(SS_C, HIGH);
+#endif
 
   rfidA.PCD_Init();
+#if !SINGLE_RFID_SERIAL_SWITCH
   rfidB.PCD_Init();
   rfidC.PCD_Init();
+#endif
 
   pinMode(RED,OUTPUT);
   pinMode(YELLOW,OUTPUT);
   pinMode(GREEN,OUTPUT);
 
   Serial.println("Smart Traffic System Started");
+#if SINGLE_RFID_SERIAL_SWITCH
+  Serial.println("[RFID] Single-reader mode: type A/B/C to select role on SS=5");
+#endif
 }
 
 bool isEmergencyUID(const String &uid)
@@ -225,13 +317,15 @@ void enterEmergencyMode(const String &uid)
 
 bool checkEmergencyFromRFIDA()
 {
-  if(!rfidA.PICC_IsNewCardPresent()) return false;
-  if(!rfidA.PICC_ReadCardSerial()) return false;
+  handleSerialRFIDRoleSwitch();
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_A)
+    return false;
+#endif
 
-  String uid = readUID(rfidA);
-
-  rfidA.PICC_HaltA();
-  rfidA.PCD_StopCrypto1();
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_A), uid))
+    return false;
 
   if (isEmergencyUID(uid))
   {
@@ -246,21 +340,26 @@ void handleEmergencyMode()
   // Keep all signals RED until emergency vehicle is seen at RFID-C (passed stop line), or timeout.
   while (emergencyActive)
   {
+    handleSerialRFIDRoleSwitch();
     forceAllRed();
 
     // Clear emergency once the same UID is detected at RFID-C.
-    if(rfidC.PICC_IsNewCardPresent() && rfidC.PICC_ReadCardSerial())
     {
-      String uid = readUID(rfidC);
-      rfidC.PICC_HaltA();
-      rfidC.PCD_StopCrypto1();
-
-      if (uid.equalsIgnoreCase(emergencyUID))
+#if SINGLE_RFID_SERIAL_SWITCH
+      if (activeRFIDRole == RFID_ROLE_C)
+#endif
       {
-        Serial.print("Emergency vehicle passed (RFID-C): ");
-        Serial.println(uid);
-        emergencyActive = false;
-        break;
+        String uid;
+        if (readCardFromReader(readerForRole(RFID_ROLE_C), uid))
+        {
+          if (uid.equalsIgnoreCase(emergencyUID))
+          {
+            Serial.print("Emergency vehicle passed (RFID-C): ");
+            Serial.println(uid);
+            emergencyActive = false;
+            break;
+          }
+        }
       }
     }
 
@@ -306,15 +405,22 @@ void trafficCycle()
 
   while(true)
   {
+#if SINGLE_RFID_SERIAL_SWITCH
+    handleSerialRFIDRoleSwitch();
+#endif
     // Emergency can arrive any time; check RFID-A first.
+#if !SINGLE_RFID_SERIAL_SWITCH
     if (checkEmergencyFromRFIDA())
     {
       handleEmergencyMode();
       return;
     }
+#endif
 
     detectOpposite();
+    delay(20);
     detectApproaching();
+    delay(20);
 
     if (emergencyActive)
     {
@@ -323,6 +429,7 @@ void trafficCycle()
     }
 
     detectStopLineViolation();
+    delay(20);
 
     adjustTiming();
 
@@ -365,13 +472,14 @@ void detectOpposite()
 {
   if (!redPhase) return;
 
-  if(!rfidB.PICC_IsNewCardPresent()) return;
-  if(!rfidB.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_B)
+    return;
+#endif
 
-  String uid = readUID(rfidB);
-
-  rfidB.PICC_HaltA();
-  rfidB.PCD_StopCrypto1();
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_B), uid))
+    return;
 
   // If this UID was already seen on RFID-A, then RFID-B is the same-lane "middle" checkpoint,
   // not an opposite vehicle.
@@ -396,13 +504,14 @@ void detectOpposite()
 
 void detectApproaching()
 {
-  if(!rfidA.PICC_IsNewCardPresent()) return;
-  if(!rfidA.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_A)
+    return;
+#endif
 
-  String uid = readUID(rfidA);
-
-  rfidA.PICC_HaltA();
-  rfidA.PCD_StopCrypto1();
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_A), uid))
+    return;
 
   // Emergency vehicle priority triggers immediately.
   if (isEmergencyUID(uid))
@@ -476,13 +585,14 @@ void detectStopLineViolation()
 {
   if (!redPhase) return; // violation only during RED
 
-  if(!rfidC.PICC_IsNewCardPresent()) return;
-  if(!rfidC.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_C)
+    return;
+#endif
 
-  String uid = readUID(rfidC);
-
-  rfidC.PICC_HaltA();
-  rfidC.PCD_StopCrypto1();
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_C), uid))
+    return;
 
   // If this UID is currently classified as opposite/other-road, never generate challan for it.
   if (isOppositeBlocked(uid))
