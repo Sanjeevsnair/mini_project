@@ -1,7 +1,93 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-void trafficCycle(); void adjustTiming(); void countdown(int t);
+// RFID pins
+// =======================================================
+// sda = 15
+// rst = 27
+// sck = 2
+// mosi = 0
+// miso = 4
+
+// traffic light pins
+// =======================================================
+// RED = 26
+// YELLOW = 25
+// GREEN = 33
+
+// 74HC595 pin connections
+// =======================================================
+// IC 1 pin 9 -> IC 2 pin 14 (DS)
+// IC 1 pin 11 -> IC 2 pin 11
+// IC 1 pin 12 -> IC 2 pin 12
+
+// DATA_PIN = 23
+// CLOCK_PIN = 18
+// LATCH_PIN = 5
+
+// =======================================================
+// RFID MODE
+// =======================================================
+#define SINGLE_RFID_SERIAL_SWITCH 1
+
+bool readCardFromReader(MFRC522 &reader, String &uidOut)
+{
+  if (!reader.PICC_IsNewCardPresent()) return false;
+  if (!reader.PICC_ReadCardSerial()) return false;
+
+  String uid = "";
+  for (byte i = 0; i < reader.uid.size; i++)
+  {
+    if (reader.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(reader.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  reader.PICC_HaltA();
+  reader.PCD_StopCrypto1();
+
+  reader.PCD_AntennaOff();
+  delay(10);
+  reader.PCD_AntennaOn();
+
+  uidOut = uid;
+  return true;
+}
+
+enum RFIDRole { RFID_ROLE_A, RFID_ROLE_B, RFID_ROLE_C };
+static RFIDRole activeRFIDRole = RFID_ROLE_A;
+
+void handleSerialRFIDRoleSwitch()
+{
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+
+    if (c == 'A' || c == 'a')
+    {
+      activeRFIDRole = RFID_ROLE_A;
+      Serial.println("[RFID] Active role = A (Approaching)");
+    }
+    else if (c == 'B' || c == 'b')
+    {
+      activeRFIDRole = RFID_ROLE_B;
+      Serial.println("[RFID] Active role = B (Middle/Opposite)");
+    }
+    else if (c == 'C' || c == 'c')
+    {
+      activeRFIDRole = RFID_ROLE_C;
+      Serial.println("[RFID] Active role = C (Stop-line)");
+    }
+  }
+}
+
+MFRC522 &readerForRole(RFIDRole role);
+
+void trafficCycle();
+void adjustTiming();
+void countdown(int t);
 void detectOpposite();
 void detectApproaching();
 void detectStopLineViolation();
@@ -12,58 +98,112 @@ void forceAllRed();
 void enterEmergencyMode(const String &uid);
 void handleEmergencyMode();
 
-#define SS_A 5
+// =======================================================
+// RFID PINS
+// =======================================================
+#define SS_A 15
 #define SS_B 17
 #define SS_C 16
-#define RST_PIN 22
+#define RST_PIN 27
 
 MFRC522 rfidA(SS_A, RST_PIN);
 MFRC522 rfidB(SS_B, RST_PIN);
 MFRC522 rfidC(SS_C, RST_PIN);
 
-#define RED 25
-#define YELLOW 26
-#define GREEN 27
+MFRC522 &readerForRole(RFIDRole role)
+{
+#if SINGLE_RFID_SERIAL_SWITCH
+  (void)role;
+  return rfidA;
+#else
+  switch (role)
+  {
+    case RFID_ROLE_A: return rfidA;
+    case RFID_ROLE_B: return rfidB;
+    case RFID_ROLE_C: return rfidC;
+  }
+  return rfidA;
+#endif
+}
 
-const int DEFAULT_GREEN_TIME = 10;
-const int DEFAULT_RED_TIME = 20;
+// =======================================================
+// TRAFFIC LIGHT PINS
+// =======================================================
+#define RED 26
+#define YELLOW 25
+#define GREEN 33
+
+// =======================================================
+// 74HC595 PINS
+// =======================================================
+#define DATA_PIN 23
+#define CLOCK_PIN 18
+#define LATCH_PIN 5
+
+// =======================================================
+// 7 SEGMENT DIGIT MAP (COMMON CATHODE)
+// bit order: DP G F E D C B A
+// =======================================================
+byte digitMap[10] = {
+  0b00111111, // 0
+  0b00000110, // 1
+  0b01011011, // 2
+  0b01001111, // 3
+  0b01100110, // 4
+  0b01101101, // 5
+  0b01111101, // 6
+  0b00000111, // 7
+  0b01111111, // 8
+  0b01101111  // 9
+};
+
+// blank display
+byte blankCode = 0b00000000;
+
+// =======================================================
+// SYSTEM TIMING
+// =======================================================
+const int DEFAULT_GREEN_TIME = 30;
+const int DEFAULT_RED_TIME = 60;
 const int YELLOW_TIME = 5;
 
 int greenTime = DEFAULT_GREEN_TIME;
 int redTime = DEFAULT_RED_TIME;
 
-int maxGreen = 20;
-int minRed = 3;
+int maxGreen = 45;
+int minRed = 10;
 
 int vehicleCount = 0;
 bool redPhase = false;
 
-// Emergency vehicle priority
+// =======================================================
+// EMERGENCY
+// =======================================================
 bool emergencyActive = false;
 bool emergencyAbortCycle = false;
 String emergencyUID = "";
 unsigned long emergencyStartMs = 0;
 const unsigned long EMERGENCY_TIMEOUT_MS = 20000;
 
-// Add your emergency vehicle tag UIDs here (AMBULANCE / FIRE / POLICE).
-// UIDs must match the value printed by Serial (uppercase hex string).
 static const char *EMERGENCY_UIDS[] = {
   "1C284C06",
   "EC6D4D06",
 };
 static const size_t EMERGENCY_UIDS_COUNT = sizeof(EMERGENCY_UIDS) / sizeof(EMERGENCY_UIDS[0]);
 
+// =======================================================
+// UID STORAGE
+// =======================================================
 const int MAX_UIDS = 40;
 String ignoreUID[MAX_UIDS];
 int ignoreCount = 0;
 unsigned long ignoreUntil[MAX_UIDS];
 
-const unsigned long OPPOSITE_BLOCK_MS = 30000; // how long an opposite UID stays blocked (ms)
+const unsigned long OPPOSITE_BLOCK_MS = 30000;
 
 String lastIgnorePrintUID = "";
 unsigned long lastIgnorePrintMs = 0;
 
-// Seen lists for e-challan eligibility (must be seen on BOTH A and B, then detected on C)
 String seenAUID[MAX_UIDS];
 int seenACount = 0;
 String seenBUID[MAX_UIDS];
@@ -75,6 +215,55 @@ const int MAX_QUEUE = 40;
 String queueUID[MAX_QUEUE];
 int queueCount = 0;
 
+// =======================================================
+// 7 SEGMENT FUNCTIONS
+// =======================================================
+void setupShiftRegister()
+{
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+}
+
+void sendToShiftRegisters(byte leftDigit, byte rightDigit)
+{
+  digitalWrite(LATCH_PIN, LOW);
+
+  // FIRST shifted byte goes to far IC (LEFT digit)
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, leftDigit);
+
+  // SECOND shifted byte goes to near IC (RIGHT digit)
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, rightDigit);
+
+  digitalWrite(LATCH_PIN, HIGH);
+}
+
+void displayNumber(int num)
+{
+  if (num < 0) num = 0;
+  if (num > 99) num = 99;
+
+  int tens = num / 10;
+  int ones = num % 10;
+
+  byte leftCode;
+  byte rightCode;
+
+  // show leading zero always: 00, 01, 02 ...
+  leftCode = digitMap[tens];
+  rightCode = digitMap[ones];
+
+  sendToShiftRegisters(leftCode, rightCode);
+}
+
+void displayBlank()
+{
+  sendToShiftRegisters(blankCode, blankCode);
+}
+
+// =======================================================
+// HELPERS
+// =======================================================
 String readUID(MFRC522 &reader)
 {
   String uid = "";
@@ -155,41 +344,43 @@ void addUID(String list[], int &size, String uid)
     list[size++] = uid;
 }
 
-void removeUID(String list[], int &size, String uid)
-{
-  for(int i=0;i<size;i++)
-  {
-    if(list[i]==uid)
-    {
-      for(int j=i;j<size-1;j++)
-        list[j]=list[j+1];
-      size--;
-      return;
-    }
-  }
-}
-
+// =======================================================
+// SETUP
+// =======================================================
 void setup()
 {
-  Serial.begin(9600);
-  SPI.begin();
+  Serial.begin(115200);
 
-  // Ensure all MFRC522 SS pins are de-selected before init (important for multi-reader SPI)
+  SPI.begin(2, 4, 0, SS_A);
+
   pinMode(SS_A, OUTPUT); digitalWrite(SS_A, HIGH);
+#if !SINGLE_RFID_SERIAL_SWITCH
   pinMode(SS_B, OUTPUT); digitalWrite(SS_B, HIGH);
   pinMode(SS_C, OUTPUT); digitalWrite(SS_C, HIGH);
+#endif
 
   rfidA.PCD_Init();
+#if !SINGLE_RFID_SERIAL_SWITCH
   rfidB.PCD_Init();
   rfidC.PCD_Init();
+#endif
 
-  pinMode(RED,OUTPUT);
-  pinMode(YELLOW,OUTPUT);
-  pinMode(GREEN,OUTPUT);
+  pinMode(RED, OUTPUT);
+  pinMode(YELLOW, OUTPUT);
+  pinMode(GREEN, OUTPUT);
+
+  setupShiftRegister();
+  displayNumber(0);
 
   Serial.println("Smart Traffic System Started");
+#if SINGLE_RFID_SERIAL_SWITCH
+  Serial.println("[RFID] Single-reader mode: type A/B/C to select role on SS=15");
+#endif
 }
 
+// =======================================================
+// EMERGENCY FUNCTIONS
+// =======================================================
 bool isEmergencyUID(const String &uid)
 {
   for (size_t i = 0; i < EMERGENCY_UIDS_COUNT; i++)
@@ -225,13 +416,15 @@ void enterEmergencyMode(const String &uid)
 
 bool checkEmergencyFromRFIDA()
 {
-  if(!rfidA.PICC_IsNewCardPresent()) return false;
-  if(!rfidA.PICC_ReadCardSerial()) return false;
+  handleSerialRFIDRoleSwitch();
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_A)
+    return false;
+#endif
 
-  String uid = readUID(rfidA);
-
-  rfidA.PICC_HaltA();
-  rfidA.PCD_StopCrypto1();
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_A), uid))
+    return false;
 
   if (isEmergencyUID(uid))
   {
@@ -243,24 +436,30 @@ bool checkEmergencyFromRFIDA()
 
 void handleEmergencyMode()
 {
-  // Keep all signals RED until emergency vehicle is seen at RFID-C (passed stop line), or timeout.
   while (emergencyActive)
   {
+    handleSerialRFIDRoleSwitch();
     forceAllRed();
 
-    // Clear emergency once the same UID is detected at RFID-C.
-    if(rfidC.PICC_IsNewCardPresent() && rfidC.PICC_ReadCardSerial())
-    {
-      String uid = readUID(rfidC);
-      rfidC.PICC_HaltA();
-      rfidC.PCD_StopCrypto1();
+    // display "00" during emergency hold
+    displayNumber(0);
 
-      if (uid.equalsIgnoreCase(emergencyUID))
+    {
+#if SINGLE_RFID_SERIAL_SWITCH
+      if (activeRFIDRole == RFID_ROLE_C)
+#endif
       {
-        Serial.print("Emergency vehicle passed (RFID-C): ");
-        Serial.println(uid);
-        emergencyActive = false;
-        break;
+        String uid;
+        if (readCardFromReader(readerForRole(RFID_ROLE_C), uid))
+        {
+          if (uid.equalsIgnoreCase(emergencyUID))
+          {
+            Serial.print("Emergency vehicle passed (RFID-C): ");
+            Serial.println(uid);
+            emergencyActive = false;
+            break;
+          }
+        }
       }
     }
 
@@ -275,11 +474,17 @@ void handleEmergencyMode()
   }
 }
 
+// =======================================================
+// MAIN LOOP
+// =======================================================
 void loop()
 {
   trafficCycle();
 }
 
+// =======================================================
+// TRAFFIC CYCLE
+// =======================================================
 void trafficCycle()
 {
   emergencyAbortCycle = false;
@@ -294,9 +499,9 @@ void trafficCycle()
   greenTime = DEFAULT_GREEN_TIME;
   redTime = DEFAULT_RED_TIME;
 
-  digitalWrite(GREEN,LOW);
-  digitalWrite(YELLOW,LOW);
-  digitalWrite(RED,HIGH);
+  digitalWrite(GREEN, LOW);
+  digitalWrite(YELLOW, LOW);
+  digitalWrite(RED, HIGH);
 
   redPhase = true;
 
@@ -306,15 +511,22 @@ void trafficCycle()
 
   while(true)
   {
-    // Emergency can arrive any time; check RFID-A first.
+#if SINGLE_RFID_SERIAL_SWITCH
+    handleSerialRFIDRoleSwitch();
+#endif
+
+#if !SINGLE_RFID_SERIAL_SWITCH
     if (checkEmergencyFromRFIDA())
     {
       handleEmergencyMode();
       return;
     }
+#endif
 
     detectOpposite();
+    delay(20);
     detectApproaching();
+    delay(20);
 
     if (emergencyActive)
     {
@@ -323,6 +535,7 @@ void trafficCycle()
     }
 
     detectStopLineViolation();
+    delay(20);
 
     adjustTiming();
 
@@ -332,49 +545,49 @@ void trafficCycle()
     Serial.print("RED Timer: ");
     Serial.println(remaining);
 
+    displayNumber(remaining);
+
     delay(1000);
     elapsed++;
   }
 
   redPhase = false;
 
-  digitalWrite(RED,LOW);
-  digitalWrite(GREEN,HIGH);
+  digitalWrite(RED, LOW);
+  digitalWrite(GREEN, HIGH);
 
   Serial.println("GREEN SIGNAL");
-
   countdown(greenTime);
 
-  if (emergencyAbortCycle)
-    return;
+  if (emergencyAbortCycle) return;
 
-  digitalWrite(GREEN,LOW);
-  digitalWrite(YELLOW,HIGH);
+  digitalWrite(GREEN, LOW);
+  digitalWrite(YELLOW, HIGH);
 
   Serial.println("YELLOW SIGNAL");
-
   countdown(YELLOW_TIME);
 
-  if (emergencyAbortCycle)
-    return;
+  if (emergencyAbortCycle) return;
 
-  digitalWrite(YELLOW,LOW);
+  digitalWrite(YELLOW, LOW);
 }
 
+// =======================================================
+// RFID DETECTION
+// =======================================================
 void detectOpposite()
 {
   if (!redPhase) return;
 
-  if(!rfidB.PICC_IsNewCardPresent()) return;
-  if(!rfidB.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_B)
+    return;
+#endif
 
-  String uid = readUID(rfidB);
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_B), uid))
+    return;
 
-  rfidB.PICC_HaltA();
-  rfidB.PCD_StopCrypto1();
-
-  // If this UID was already seen on RFID-A, then RFID-B is the same-lane "middle" checkpoint,
-  // not an opposite vehicle.
   if (uidExists(seenAUID, seenACount, uid))
   {
     if(!uidExists(seenBUID, seenBCount, uid))
@@ -396,23 +609,21 @@ void detectOpposite()
 
 void detectApproaching()
 {
-  if(!rfidA.PICC_IsNewCardPresent()) return;
-  if(!rfidA.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_A)
+    return;
+#endif
 
-  String uid = readUID(rfidA);
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_A), uid))
+    return;
 
-  rfidA.PICC_HaltA();
-  rfidA.PCD_StopCrypto1();
-
-  // Emergency vehicle priority triggers immediately.
   if (isEmergencyUID(uid))
   {
     enterEmergencyMode(uid);
     return;
   }
 
-  // If RFID-B already classified this UID as opposite/other-road, do NOT count it as same-lane
-  // in the current red phase. It can be counted again in a later cycle if it appears again.
   if(isOppositeBlocked(uid))
   {
     unsigned long now = millis();
@@ -426,7 +637,6 @@ void detectApproaching()
     return;
   }
 
-  // Mark as seen at RFID-A (far)
   if(!uidExists(seenAUID, seenACount, uid))
     addUID(seenAUID, seenACount, uid);
 
@@ -445,8 +655,8 @@ void detectApproaching()
 
 void adjustTiming()
 {
-  int newGreen = DEFAULT_GREEN_TIME + (vehicleCount * 2);
-  int newRed = DEFAULT_RED_TIME - (vehicleCount * 2);
+  int newGreen = DEFAULT_GREEN_TIME + (vehicleCount * 3);
+  int newRed = DEFAULT_RED_TIME - (vehicleCount * 3);
 
   if(newGreen > maxGreen) newGreen = maxGreen;
   if(newRed < minRed) newRed = minRed;
@@ -459,7 +669,6 @@ void countdown(int t)
 {
   for(int i=t;i>0;i--)
   {
-    // Emergency can arrive during GREEN/YELLOW too.
     if (checkEmergencyFromRFIDA())
     {
       handleEmergencyMode();
@@ -468,23 +677,28 @@ void countdown(int t)
 
     Serial.print("Timer: ");
     Serial.println(i);
+
+    displayNumber(i);
+
     delay(1000);
   }
+
+  displayNumber(0);
 }
 
 void detectStopLineViolation()
 {
-  if (!redPhase) return; // violation only during RED
+  if (!redPhase) return;
 
-  if(!rfidC.PICC_IsNewCardPresent()) return;
-  if(!rfidC.PICC_ReadCardSerial()) return;
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_C)
+    return;
+#endif
 
-  String uid = readUID(rfidC);
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_C), uid))
+    return;
 
-  rfidC.PICC_HaltA();
-  rfidC.PCD_StopCrypto1();
-
-  // If this UID is currently classified as opposite/other-road, never generate challan for it.
   if (isOppositeBlocked(uid))
   {
     Serial.print("RFID-C detected (opposite/other-road): ");
@@ -492,7 +706,6 @@ void detectStopLineViolation()
     return;
   }
 
-  // Only generate e-challan if UID was seen on BOTH RFID-A and RFID-B
   bool eligible = uidExists(seenAUID, seenACount, uid) && uidExists(seenBUID, seenBCount, uid);
   if (!eligible)
   {
@@ -501,7 +714,6 @@ void detectStopLineViolation()
     return;
   }
 
-  // Prevent repeated challans for the same UID during the same red phase/cycle
   if (uidExists(challanUID, challanCount, uid))
     return;
 
@@ -509,6 +721,9 @@ void detectStopLineViolation()
   printEChallan(uid);
 }
 
+// =======================================================
+// SAMPLE DATABASE
+// =======================================================
 struct VehicleRecord {
   const char *uid;
   const char *vehicleNo;
