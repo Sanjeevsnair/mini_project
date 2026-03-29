@@ -1,4 +1,4 @@
-﻿#include <SPI.h>
+#include <SPI.h>
 #include <MFRC522.h>
 
 // =======================================================
@@ -79,6 +79,7 @@ void detectApproaching();
 void detectStopLineViolation();
 void printEChallan(const String &uid);
 bool isEmergencyUID(const String &uid);
+bool checkEmergencyFromRFIDA();
 void forceAllRed();
 void enterEmergencyMode(const String &uid);
 void handleEmergencyMode();
@@ -179,24 +180,10 @@ int currentRemainingTimer = 0;
 // EMERGENCY
 // =======================================================
 bool emergencyActive = false;
+bool emergencyAbortCycle = false;
 String emergencyUID = "";
 unsigned long emergencyStartMs = 0;
-const unsigned long EMERGENCY_TIMEOUT_MS = 60000; // Increased to 60 seconds
-unsigned long emergencyCooldownMs = 0;
-String lastEmergencyUID = "";
-
-enum EmergencyTrackingState {
-  TRACK_NONE = 0,
-  ORIGIN_WAIT_B = 1,
-  ORIGIN_WAIT_C = 2,
-  ORIGIN_DONE = 3,
-  REMOTE_WAIT_C = 4,
-  REMOTE_WAIT_B = 5,
-  REMOTE_WAIT_A = 6,
-  EMERGENCY_CLEARED = 7
-};
-
-EmergencyTrackingState emergState = TRACK_NONE;
+const unsigned long EMERGENCY_TIMEOUT_MS = 20000;
 
 static const char *EMERGENCY_UIDS[] = {
   "1C284C06",
@@ -237,9 +224,6 @@ String otherLightState = "UNKNOWN";
 bool otherEmergency = false;
 int otherRemainingTimer = 0;
 int otherHeartbeat = 0;
-String otherEmergencyUID = "NONE";
-int otherEmergState = 0;
-
 bool node1Synced = false;
 String uart2RxBuffer = "";
 
@@ -405,8 +389,6 @@ void sendNodeData()
 {
   myHeartbeat++;
 
-  String eUid = emergencyUID == "" ? "NONE" : emergencyUID;
-
   String msg = String(MY_NODE_ID) + "," +
                String(vehicleCount) + "," +
                getCurrentLightState() + "," +
@@ -414,9 +396,7 @@ void sendNodeData()
                String(currentRemainingTimer) + "," +
                String(myHeartbeat) + "," +
                String(greenTime) + "," +
-               String(redTime) + "," +
-               eUid + "," +
-               String((int)emergState);
+               String(redTime);
 
   Serial2.println(msg);
 }
@@ -430,10 +410,8 @@ void processNodePacket(const String &data)
   int p5 = data.indexOf(',', p4 + 1);
   int p6 = data.indexOf(',', p5 + 1);
   int p7 = data.indexOf(',', p6 + 1);
-  int p8 = data.indexOf(',', p7 + 1);
-  int p9 = data.indexOf(',', p8 + 1);
 
-  if (p1 == -1 || p2 == -1 || p3 == -1 || p4 == -1 || p5 == -1 || p6 == -1 || p7 == -1 || p8 == -1 || p9 == -1)
+  if (p1 == -1 || p2 == -1 || p3 == -1 || p4 == -1 || p5 == -1 || p6 == -1 || p7 == -1)
     return;
 
   otherNodeId = data.substring(0, p1).toInt();
@@ -444,16 +422,13 @@ void processNodePacket(const String &data)
   otherHeartbeat = data.substring(p5 + 1, p6).toInt();
 
   int remoteGreenTime = data.substring(p6 + 1, p7).toInt();
-  int remoteRedTime = data.substring(p7 + 1, p8).toInt();
-
-  otherEmergencyUID = data.substring(p8 + 1, p9);
-  otherEmergState = data.substring(p9 + 1).toInt();
+  int remoteRedTime = data.substring(p7 + 1).toInt();
 
   if (otherNodeId == 1)
     node1Synced = true;
 
   // Real-time synchronization: Accept shrunk times from the RED node
-  if (otherLightState == "RED" && !emergencyActive && !otherEmergency)
+  if (otherLightState == "RED")
   {
     greenTime = remoteGreenTime;
     redTime   = remoteRedTime;
@@ -463,30 +438,13 @@ void processNodePacket(const String &data)
   {
     if (!emergencyActive)
     {
-      // Cooldown check for remote triggers too!
-      if (otherEmergencyUID.equalsIgnoreCase(lastEmergencyUID) && (millis() - emergencyCooldownMs < 30000))
-      {
-          // Skip triggering emergency mode, ignore stale remote messages
-      }
-      else
-      {
-        emergencyActive = true;
-        emergState = REMOTE_WAIT_C;
-        emergencyUID = otherEmergencyUID;
-        emergencyStartMs = millis(); // IMPORTANT: Reset timer for remote node
-        forceAllRed();
+      emergencyActive = true;
+      emergencyStartMs = millis();
+      forceAllRed();
 
-        Serial.println("\n==================================================");
-        Serial.println("!!! EMERGENCY INCOMING FROM OTHER NODE !!!");
-        Serial.printf("Emergency Vehicle ID [%s] detected on Opposite Node.\n", emergencyUID.c_str());
-        Serial.println("Tracking C -> B -> A for exit.");
-        Serial.println("==================================================\n");
-      }
-    }
-    else
-    {
-        // Update timeout while still receiving emergency signals
-        emergencyStartMs = millis();
+      Serial.println("\n======================================");
+      Serial.println("!!! EMERGENCY OVERRIDE FROM OTHER NODE");
+      Serial.println("======================================\n");
     }
   }
 }
@@ -573,19 +531,33 @@ void forceAllRed() { setRedSignal(); }
 void enterEmergencyMode(const String &uid)
 {
   emergencyActive = true;
+  emergencyAbortCycle = true;
   emergencyUID = uid;
-  emergState = ORIGIN_WAIT_B;
   emergencyStartMs = millis();
   forceAllRed();
+}
 
-  Serial.println("\n==================================================");
-  Serial.printf("[EMERGENCY] Vehicle ID %s detected on our node!\n", uid.c_str());
-  Serial.println("ALL LIGHTS TO RED. Tracking A -> B -> C.\n==================================================\n");
+bool checkEmergencyFromRFIDA()
+{
+  handleSerialRFIDRoleSwitch();
+#if SINGLE_RFID_SERIAL_SWITCH
+  if (activeRFIDRole != RFID_ROLE_A) return false;
+#endif
+
+  String uid;
+  if (!readCardFromReader(readerForRole(RFID_ROLE_A), uid)) return false;
+
+  if (isEmergencyUID(uid))
+  {
+    enterEmergencyMode(uid);
+    return true;
+  }
+  return false;
 }
 
 void handleEmergencyMode()
 {
-  while (emergencyActive || otherEmergency)
+  while (emergencyActive)
   {
     handleSerialRFIDRoleSwitch();
     forceAllRed();
@@ -595,102 +567,29 @@ void handleEmergencyMode()
     sendNodeData();
     receiveNodeData();
 
-    // Check completion condition
-    if (emergState == EMERGENCY_CLEARED || otherEmergState == EMERGENCY_CLEARED) {
-       Serial.println("\n*** EMERGENCY VEHICLE HAS LEFT THE JUNCTION ***");
-       Serial.println("*** RESUMING PREVIOUS TRAFFIC STATE ***\n");
-       
-       // Record cooldown BEFORE clearing variables!
-       lastEmergencyUID = emergencyUID;
-       emergencyCooldownMs = millis();
-       
-       emergencyActive = false;
-       otherEmergency = false;
-       emergState = TRACK_NONE;
-       emergencyUID = "";
-       
-       // Ignore stale events from UART 
-       uart2RxBuffer = ""; 
-       break;
+#if SINGLE_RFID_SERIAL_SWITCH
+    if (activeRFIDRole == RFID_ROLE_C)
+#endif
+    {
+      String uid;
+      if (readCardFromReader(readerForRole(RFID_ROLE_C), uid))
+      {
+        if (uid.equalsIgnoreCase(emergencyUID))
+        {
+          emergencyActive = false;
+          otherEmergency = false;
+          break;
+        }
+      }
     }
 
-    // Time out protection
     if (millis() - emergencyStartMs > EMERGENCY_TIMEOUT_MS)
     {
-       Serial.println("\n*** EMERGENCY TIMEOUT - RESUMING PREVIOUS STATE ***\n");
-       
-       lastEmergencyUID = emergencyUID;
-       emergencyCooldownMs = millis();
-       
-       emergencyActive = false;
-       otherEmergency = false;
-       emergState = TRACK_NONE;
-       emergencyUID = "";
-       break;
+      emergencyActive = false;
+      otherEmergency = false;
+      break;
     }
-
-    String uid;
-    
-    // Tracking logic for Origin Node
-    if (emergState == ORIGIN_WAIT_B) {
-#if SINGLE_RFID_SERIAL_SWITCH
-      if (activeRFIDRole == RFID_ROLE_B)
-#endif
-      {
-         if (readCardFromReader(readerForRole(RFID_ROLE_B), uid) && uid.equalsIgnoreCase(emergencyUID)) {
-             emergState = ORIGIN_WAIT_C;
-             Serial.printf("[EMERGENCY] Origin Node: Vehicle %s successfully passed RFID B!\n", uid.c_str());
-         }
-      }
-    }
-    else if (emergState == ORIGIN_WAIT_C) {
-#if SINGLE_RFID_SERIAL_SWITCH
-      if (activeRFIDRole == RFID_ROLE_C)
-#endif
-      {
-         if (readCardFromReader(readerForRole(RFID_ROLE_C), uid) && uid.equalsIgnoreCase(emergencyUID)) {
-             emergState = ORIGIN_DONE;
-             Serial.printf("[EMERGENCY] Origin Node: Vehicle %s successfully passed RFID C! Waiting for opposite node...\n", uid.c_str());
-         }
-      }
-    }
-
-    // Tracking logic for Remote Node
-    if (emergState == REMOTE_WAIT_C) {
-#if SINGLE_RFID_SERIAL_SWITCH
-      if (activeRFIDRole == RFID_ROLE_C)
-#endif
-      {
-         if (readCardFromReader(readerForRole(RFID_ROLE_C), uid) && uid.equalsIgnoreCase(emergencyUID)) {
-             emergState = REMOTE_WAIT_B;
-             Serial.printf("[EMERGENCY] Remote Node: Vehicle %s successfully entered at RFID C!\n", uid.c_str());
-         }
-      }
-    }
-    else if (emergState == REMOTE_WAIT_B) {
-#if SINGLE_RFID_SERIAL_SWITCH
-      if (activeRFIDRole == RFID_ROLE_B)
-#endif
-      {
-         if (readCardFromReader(readerForRole(RFID_ROLE_B), uid) && uid.equalsIgnoreCase(emergencyUID)) {
-             emergState = REMOTE_WAIT_A;
-             Serial.printf("[EMERGENCY] Remote Node: Vehicle %s successfully passed RFID B!\n", uid.c_str());
-         }
-      }
-    }
-    else if (emergState == REMOTE_WAIT_A) {
-#if SINGLE_RFID_SERIAL_SWITCH
-      if (activeRFIDRole == RFID_ROLE_A)
-#endif
-      {
-         if (readCardFromReader(readerForRole(RFID_ROLE_A), uid) && uid.equalsIgnoreCase(emergencyUID)) {
-             emergState = EMERGENCY_CLEARED;
-             Serial.printf("[EMERGENCY] Remote Node: Vehicle %s successfully passed RFID A! Clear!\n", uid.c_str());
-         }
-      }
-    }
-
-    delay(20);
+    delay(100);
   }
 }
 
@@ -709,11 +608,10 @@ void loop()
     return;
   }
 
-  // Handle emergency outside traffic cycle if needed, but normally phases handle it
   if (emergencyActive || otherEmergency)
   {
     handleEmergencyMode();
-    return; // Returns to main loop and re-evaluates
+    return;
   }
 
   trafficCycle();
@@ -736,23 +634,17 @@ void runRedPhase()
 #if SINGLE_RFID_SERIAL_SWITCH
     handleSerialRFIDRoleSwitch();
 #endif
+    if (checkEmergencyFromRFIDA()) { handleEmergencyMode(); return; }
 
     detectOpposite();
     detectApproaching();
     detectStopLineViolation();
 
+    if (emergencyActive || otherEmergency) { handleEmergencyMode(); return; }
+
+    // Real-time calculation completely removes visual lag
     int elapsedSec = (millis() - phaseStartMs) / 1000;
     int remaining = redTime - elapsedSec;
-
-    if (emergencyActive || otherEmergency) 
-    { 
-      handleEmergencyMode(); 
-      // Resume timer seamlessly
-      phaseStartMs = millis() - ((redTime - remaining) * 1000);
-      setRedSignal();
-      lastDisplay = -1;
-      continue;
-    }
 
     if (remaining <= 0) break;
 
@@ -793,20 +685,11 @@ void runGreenPhase()
 #if SINGLE_RFID_SERIAL_SWITCH
     handleSerialRFIDRoleSwitch();
 #endif
-    
-    detectApproaching(); // Can detect emergency vehicles during Green
+    if (checkEmergencyFromRFIDA()) { handleEmergencyMode(); return; }
+    if (emergencyActive || otherEmergency) { handleEmergencyMode(); return; }
 
     int elapsedSec = (millis() - phaseStartMs) / 1000;
     int remaining = greenTime - elapsedSec; // Recalculates dynamically every 20ms
-
-    if (emergencyActive || otherEmergency) 
-    { 
-      handleEmergencyMode(); 
-      phaseStartMs = millis() - ((greenTime - remaining) * 1000);
-      setGreenSignal();
-      lastDisplay = -1;
-      continue;
-    }
 
     if (remaining <= 0) break;
 
@@ -847,20 +730,11 @@ void runYellowPhase()
 #if SINGLE_RFID_SERIAL_SWITCH
     handleSerialRFIDRoleSwitch();
 #endif
-    
-    detectApproaching();
+    if (checkEmergencyFromRFIDA()) { handleEmergencyMode(); return; }
+    if (emergencyActive || otherEmergency) { handleEmergencyMode(); return; }
 
     int elapsedSec = (millis() - phaseStartMs) / 1000;
     int remaining = dynamicYellowTime - elapsedSec;
-
-    if (emergencyActive || otherEmergency) 
-    { 
-      handleEmergencyMode(); 
-      phaseStartMs = millis() - ((dynamicYellowTime - remaining) * 1000);
-      setYellowSignal();
-      lastDisplay = -1;
-      continue;
-    }
 
     if (remaining <= 0) break;
 
@@ -888,6 +762,7 @@ void runYellowPhase()
 
 void trafficCycle()
 {
+  emergencyAbortCycle = false;
   vehicleCount = 0;
   queueCount = 0;
   purgeExpiredOpposites();
@@ -901,17 +776,19 @@ void trafficCycle()
 
   if (MY_NODE_ID == 1)
   {
-    runRedPhase();    
-    runGreenPhase();  
-    runYellowPhase(); 
+    runRedPhase();    if (emergencyAbortCycle) return;
+    runGreenPhase();  if (emergencyAbortCycle) return;
+    runYellowPhase(); if (emergencyAbortCycle) return;
   }
   else 
   {
-    runGreenPhase();  
-    runYellowPhase(); 
-    runRedPhase();    
+    runGreenPhase();  if (emergencyAbortCycle) return;
+    runYellowPhase(); if (emergencyAbortCycle) return;
+    runRedPhase();    if (emergencyAbortCycle) return;
   }
-} // =======================================================
+}
+
+// =======================================================
 // RFID DETECTION & ADJUSTMENT
 // =======================================================
 void detectOpposite()
@@ -952,19 +829,10 @@ void detectApproaching()
 
   if (isEmergencyUID(uid))
   {
-    // Check if this emergency vehicle was just processed
-    if (uid.equalsIgnoreCase(lastEmergencyUID) && (millis() - emergencyCooldownMs < 30000))
-    {
-       // Skip triggering again if within 30 seconds
-       return;
-    }
-
+    Serial.printf("[RFID A] EMERGENCY VEHICLE DETECTED! ID: %s\n", uid.c_str());
     enterEmergencyMode(uid);
     return;
   }
-
-  // ONLY PROCESS NORMAL VEHICLES DURING RED PHASE!
-  if (!redPhase) return;
 
   if (isOppositeBlocked(uid)) 
   {
