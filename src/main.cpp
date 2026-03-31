@@ -4,7 +4,7 @@
 // =======================================================
 // NODE CONFIGURATION
 // =======================================================
-#define MY_NODE_ID 1 // CHANGE TO 1 OR 2
+#define MY_NODE_ID 2 // CHANGE TO 1 OR 2
 
 #define TXD2 17
 #define RXD2 16
@@ -98,10 +98,10 @@ int calculateDynamicYellowTime();
 // =======================================================
 // RFID PINS
 // =======================================================
-#define SS_A 15
-#define SS_B 17
-#define SS_C 16
-#define RST_PIN 27
+#define SS_A 13
+#define SS_B 14
+#define SS_C 27
+#define RST_PIN 19
 
 MFRC522 rfidA(SS_A, RST_PIN);
 MFRC522 rfidB(SS_B, RST_PIN);
@@ -126,16 +126,16 @@ MFRC522 &readerForRole(RFIDRole role)
 // =======================================================
 // TRAFFIC LIGHT PINS
 // =======================================================
-#define RED 26
-#define YELLOW 25
-#define GREEN 33
+#define RED 32
+#define YELLOW 33
+#define GREEN 15
 
 // =======================================================
 // 74HC595 PINS
 // =======================================================
-#define DATA_PIN 23
-#define CLOCK_PIN 18
-#define LATCH_PIN 5
+#define DATA_PIN 18
+#define CLOCK_PIN 5
+#define LATCH_PIN 4
 
 // =======================================================
 // 7 SEGMENT DIGIT MAP (COMMON CATHODE)
@@ -259,8 +259,8 @@ void setupShiftRegister()
 void sendToShiftRegisters(byte leftDigit, byte rightDigit)
 {
   digitalWrite(LATCH_PIN, LOW);
-  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, leftDigit);
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, rightDigit);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, leftDigit);
   digitalWrite(LATCH_PIN, HIGH);
 }
 
@@ -527,7 +527,8 @@ void setup()
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
 
-  SPI.begin(2, 19, 4, SS_A);
+  // SPI.begin(SCK, MISO, MOSI, SS);
+  SPI.begin(23, 21, 22, SS_A);
 
   pinMode(SS_A, OUTPUT); digitalWrite(SS_A, HIGH);
 #if !SINGLE_RFID_SERIAL_SWITCH
